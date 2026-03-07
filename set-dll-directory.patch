@@ -1,0 +1,83 @@
+--- a/crates/launcher/src/game.rs	2026-03-07 01:50:54.544343652 +0200
++++ crates/launcher/src/game.rs	2026-03-07 01:51:51.937935464 +0200
+@@ -146,7 +146,7 @@
+ }
+ 
+ fn inject_dll(process: &OwnedHandle, path: &Path) -> LauncherResult<()> {
+-    let path = path
++    let path_wide = path
+         .as_os_str()
+         .encode_wide()
+         .chain(iter::once(b'\0' as u16))
+@@ -156,12 +156,59 @@
+         let process_handle = HANDLE(process.as_raw_handle());
+ 
+         let kernel32 = GetModuleHandleW(w!("kernel32.dll"))?;
++
++        // Add the directory containing the DLL to the remote process's DLL
++        // search path so that any runtime library dependencies bundled
++        // alongside it (e.g. compiler runtime DLLs) are found when Windows
++        // resolves imports during LoadLibraryW.
++        if let Some(dll_dir) = path.parent() {
++            let set_dll_directory = GetProcAddress(kernel32, s!("SetDllDirectoryW"));
++
++            let dll_dir_wide: Vec<u16> = dll_dir
++                .as_os_str()
++                .encode_wide()
++                .chain(iter::once(0))
++                .collect();
++
++            let dir_str = VirtualAllocEx(
++                process_handle,
++                None,
++                dll_dir_wide.len() * 2,
++                MEM_COMMIT | MEM_RESERVE,
++                PAGE_EXECUTE_READWRITE,
++            );
++
++            WriteProcessMemory(
++                process_handle,
++                dir_str,
++                dll_dir_wide.as_ptr() as *const c_void,
++                dll_dir_wide.len() * 2,
++                None,
++            )?;
++
++            let thread = CreateRemoteThread(
++                process_handle,
++                None,
++                0,
++                Some(mem::transmute(set_dll_directory)),
++                Some(dir_str),
++                0,
++                None,
++            )?;
++
++            if WaitForSingleObject(thread, INFINITE) != WAIT_OBJECT_0 {
++                return Err(WinError::from_thread().into());
++            }
++
++            CloseHandle(thread)?;
++        }
++
+         let load_library = GetProcAddress(kernel32, s!("LoadLibraryW"));
+ 
+         let path_str = VirtualAllocEx(
+             process_handle,
+             None,
+-            path.len() * 2,
++            path_wide.len() * 2,
+             MEM_COMMIT | MEM_RESERVE,
+             PAGE_EXECUTE_READWRITE,
+         );
+@@ -169,8 +216,8 @@
+         WriteProcessMemory(
+             process_handle,
+             path_str,
+-            path.as_ptr() as *const c_void,
+-            path.len() * 2,
++            path_wide.as_ptr() as *const c_void,
++            path_wide.len() * 2,
+             None,
+         )?;
+ 
